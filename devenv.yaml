@@ -1,0 +1,22 @@
+inputs:
+  agents:
+    url: github:smdex/llm-agents.nix
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-unstable
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+nixpkgs:
+  allowUnfree: true
+secretspec:
+  enable: true
