@@ -2718,6 +2718,16 @@ impl Screen {
                 "ResumePaneAfterForward: pane {:?} not in any tab, fell back to direct PTY write",
                 pane_id
             );
+        } else {
+            // Resuming a pane can re-feed PTY bytes that were buffered
+            // behind the forwarded query. Those bytes may update the
+            // visible terminal contents (eg. a fish/starship prompt
+            // emitted after an OSC 11 query), but this path is not
+            // reached through the normal PtyBytes handler that schedules
+            // RenderToClients. Without this explicit render request, the
+            // freshly-drained output can remain invisible until the next
+            // keypress or other screen event.
+            self.render(None)?;
         }
         Ok(())
     }

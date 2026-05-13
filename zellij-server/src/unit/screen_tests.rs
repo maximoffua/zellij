@@ -8398,6 +8398,7 @@ pub fn pty_bytes_and_hold_pane_buffered_before_new_pane() {
 struct ForwardCapture {
     server_rx: Receiver<(ServerInstruction, ErrorContext)>,
     pty_writer_rx: Receiver<(PtyWriteInstruction, ErrorContext)>,
+    background_jobs_rx: Receiver<(BackgroundJob, ErrorContext)>,
 }
 
 impl ForwardCapture {
@@ -8425,16 +8426,27 @@ impl ForwardCapture {
         }
         out
     }
+
+    fn drain_background_jobs(&self) -> Vec<BackgroundJob> {
+        let mut out = Vec::new();
+        while let Ok((job, _ctx)) = self.background_jobs_rx.try_recv() {
+            out.push(job);
+        }
+        out
+    }
 }
 
 fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture) {
     let (server_tx, server_rx) = channels::unbounded::<(ServerInstruction, ErrorContext)>();
     let (pty_writer_tx, pty_writer_rx) =
         channels::unbounded::<(PtyWriteInstruction, ErrorContext)>();
+    let (background_jobs_tx, background_jobs_rx) =
+        channels::unbounded::<(BackgroundJob, ErrorContext)>();
 
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     bus.senders.to_server = Some(SenderWithContext::new(server_tx));
     bus.senders.to_pty_writer = Some(SenderWithContext::new(pty_writer_tx));
+    bus.senders.to_background_jobs = Some(SenderWithContext::new(background_jobs_tx));
     let fake_os_input = FakeInputOutput::default();
     bus.os_input = Some(Box::new(fake_os_input));
 
@@ -8504,6 +8516,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         ForwardCapture {
             server_rx,
             pty_writer_rx,
+            background_jobs_rx,
         },
     )
 }
@@ -9456,6 +9469,30 @@ fn forwarded_reply_routes_through_tab_for_unpaused_pane() {
     let writes = capture.drain_pty_writes();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0], (reply, 7));
+}
+
+#[test]
+fn resume_after_forward_schedules_render_for_existing_pane() {
+    // Regression guard for shells/prompts that emit host-color queries
+    // while drawing the prompt (eg. fish + starship). Bytes after the
+    // query are buffered until the host reply resumes the pane; that
+    // resume path must request a render, otherwise the prompt remains
+    // invisible until the next key/input event.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, capture) = create_new_screen_with_forward_capture(size);
+    new_tab(&mut screen, 1, 0);
+    let _ = capture.drain_background_jobs();
+
+    screen
+        .resume_pane_after_forward(PaneId::Terminal(1), Vec::new())
+        .expect("resume existing pane");
+
+    assert!(
+        capture
+            .drain_background_jobs()
+            .contains(&BackgroundJob::RenderToClients),
+        "resuming an existing pane after a forwarded query must schedule a render"
+    );
 }
 
 #[test]
