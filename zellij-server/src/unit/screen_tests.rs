@@ -1,4 +1,5 @@
 use super::{screen_thread_main, CopyOptions, Screen, ScreenInstruction};
+use crate::output::Output;
 use crate::panes::PaneId;
 use crate::{
     channels::SenderWithContext, os_input_output::ServerOsApi, route::route_action,
@@ -806,6 +807,35 @@ fn new_tab(screen: &mut Screen, pid: u32, tab_index: usize) {
             TiledPaneLayout::default(),
             vec![], // floating panes layout
             new_terminal_ids,
+            vec![], // new floating terminal ids
+            new_plugin_ids,
+            tab_index,
+            true,
+            (client_id, false),
+            None,
+        )
+        .expect("TEST");
+}
+
+fn new_plugin_tab(screen: &mut Screen, plugin_id: u32, tab_index: usize) {
+    let client_id = 1;
+    let fake_plugin_url = "file:/path/to/fake/plugin";
+    let run_plugin = RunPluginOrAlias::from_url(fake_plugin_url, &None, None, None).expect("TEST");
+    let mut tab_layout = TiledPaneLayout::default();
+    tab_layout.children_split_direction = SplitDirection::Vertical;
+    let mut child = TiledPaneLayout::default();
+    child.run = Some(Run::Plugin(run_plugin.clone()));
+    tab_layout.children.push(child);
+    let mut new_plugin_ids = HashMap::new();
+    new_plugin_ids.insert(run_plugin, vec![plugin_id]);
+    screen
+        .new_tab(tab_index, (vec![], vec![]), None, Some(client_id))
+        .expect("TEST");
+    screen
+        .apply_layout(
+            tab_layout,
+            vec![], // floating panes layout
+            vec![], // new terminal ids
             vec![], // new floating terminal ids
             new_plugin_ids,
             tab_index,
@@ -8382,10 +8412,12 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
     let (server_tx, server_rx) = channels::unbounded::<(ServerInstruction, ErrorContext)>();
     let (pty_writer_tx, pty_writer_rx) =
         channels::unbounded::<(PtyWriteInstruction, ErrorContext)>();
+    let (plugin_tx, _plugin_rx) = channels::unbounded::<(PluginInstruction, ErrorContext)>();
 
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     bus.senders.to_server = Some(SenderWithContext::new(server_tx));
     bus.senders.to_pty_writer = Some(SenderWithContext::new(pty_writer_tx));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
     let fake_os_input = FakeInputOutput::default();
     bus.os_input = Some(Box::new(fake_os_input));
 
@@ -8786,6 +8818,69 @@ fn plugin_pane_reply_is_dropped_without_write() {
     assert!(
         screen.forward_in_flight_token.is_none(),
         "slot still released"
+    );
+}
+
+#[test]
+fn osc_11_forward_cycle_does_not_blank_plugin_panes() {
+    // Regression guard for the narrow OSC 11 forwarding path: a
+    // terminal-pane host-query round trip must not route bytes through
+    // plugin panes or make an existing plugin pane unrenderable. This
+    // specifically covers the session/plugin-manager blank-pane class
+    // of regression reported against the broader branch.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, capture) = create_new_screen_with_forward_capture(size);
+    new_tab(&mut screen, 1, 0);
+    new_plugin_tab(&mut screen, 99, 1);
+
+    assert!(
+        screen.tabs.values().any(|tab| tab.has_plugin(99)),
+        "precondition: plugin pane must exist before the terminal forward cycle"
+    );
+
+    let token = screen.forward_host_query(PaneId::Terminal(1), bg_query());
+    let forwards = capture.drain_forward_queries();
+    assert_eq!(forwards.len(), 1, "OSC 11 query should dispatch once");
+    assert_eq!(
+        forwards[0],
+        (token, bg_query().to_query_bytes()),
+        "forwarded bytes must remain the OSC 11 background query"
+    );
+
+    let reply = b"\x1b]11;rgb:1111/2222/3333\x1b\\".to_vec();
+    screen
+        .handle_forwarded_reply_from_host(token, reply.clone())
+        .expect("terminal OSC 11 reply should resume cleanly");
+
+    let writes = capture.drain_pty_writes();
+    assert_eq!(
+        writes,
+        vec![(reply, 1)],
+        "forwarded reply must be written only to the originating terminal pane"
+    );
+    assert!(
+        screen.tabs.values().any(|tab| tab.has_plugin(99)),
+        "plugin pane must still exist after the terminal forward cycle"
+    );
+
+    let plugin_tab = screen
+        .tabs
+        .values_mut()
+        .find(|tab| tab.has_plugin(99))
+        .expect("plugin tab should still be addressable");
+    let mut output = Output::default();
+    plugin_tab
+        .render(&mut output, None)
+        .expect("plugin tab should remain renderable");
+    let rendered = output
+        .serialize()
+        .expect("render output should serialize")
+        .get(&1)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !rendered.trim().is_empty(),
+        "plugin render output should remain non-empty after terminal OSC 11 forward cycle"
     );
 }
 
