@@ -7,10 +7,9 @@ let
   };
   zellij = cargoNix.workspaceMembers.zellij.build;
   rustBuildEnv = lib.concatStringsSep " " [
-    "RUSTFLAGS='--cfg rustix_use_libc'"
     "OPENSSL_NO_VENDOR=1"
     "PKG_CONFIG_PATH='${pkgs.openssl.dev}/lib/pkgconfig'"
-    "PATH='${lib.makeBinPath [ config.git-hooks.tools.cargo pkgs.pkg-config pkgs.perl pkgs.stdenv.cc ]}:$PATH'"
+    "PATH='${lib.makeBinPath [ config.git-hooks.tools.cargo pkgs.pkg-config pkgs.perl pkgs.stdenv.cc pkgs.binutils pkgs.mold ]}:$PATH'"
   ];
 in {
   # https://devenv.sh/basics/
@@ -49,9 +48,9 @@ in {
   languages.rust = {
     enable = true;
     mold.enable = true;
-    # https://devenv.sh/reference/options/#languagesrustchannel
-    channel = "nightly";
-    rustflags = "--cfg rustix_use_libc";
+    # Keep devenv aligned with rust-toolchain.toml / Cargo.toml.
+    channel = "stable";
+    version = "1.92.0";
     components = [
       "rustc"
       "cargo"

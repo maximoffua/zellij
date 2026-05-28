@@ -8412,11 +8412,14 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
     let (server_tx, server_rx) = channels::unbounded::<(ServerInstruction, ErrorContext)>();
     let (pty_writer_tx, pty_writer_rx) =
         channels::unbounded::<(PtyWriteInstruction, ErrorContext)>();
+    let (background_jobs_tx, _background_jobs_rx) =
+        channels::unbounded::<(BackgroundJob, ErrorContext)>();
     let (plugin_tx, _plugin_rx) = channels::unbounded::<(PluginInstruction, ErrorContext)>();
 
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     bus.senders.to_server = Some(SenderWithContext::new(server_tx));
     bus.senders.to_pty_writer = Some(SenderWithContext::new(pty_writer_tx));
+    bus.senders.to_background_jobs = Some(SenderWithContext::new(background_jobs_tx));
     bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
     let fake_os_input = FakeInputOutput::default();
     bus.os_input = Some(Box::new(fake_os_input));
