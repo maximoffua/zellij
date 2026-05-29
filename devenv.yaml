@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  agents:
+    url: github:smdex/llm-agents.nix
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+    overlays:
+    - default
+  crate2nix:
+    url: github:nix-community/crate2nix
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-unstable
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+nixpkgs:
+  allow_unfree: true
+secretspec:
+  enable: true

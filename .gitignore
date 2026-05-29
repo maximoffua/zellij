@@ -5,3 +5,19 @@ target/
 .idea
 .DS_Store
 /assets/man/zellij.1
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
