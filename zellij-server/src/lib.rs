@@ -491,12 +491,15 @@ impl Drop for SessionMetaData {
     }
 }
 
-/// Remove a client from session state and synthesize empty
-/// `ForwardedReplyFromHost` instructions for any host-query forwards
-/// that had been dispatched to it. Without this, a client that goes
-/// away while holding an in-flight forward leaves `Screen`'s
+/// Remove a client from session state and release any host-query
+/// forwards that had been dispatched to it. Without this, a client
+/// that goes away while holding an in-flight forward leaves `Screen`'s
 /// `forward_in_flight` flag stuck — the flag is only released by
 /// replies, and no reply will ever come.
+///
+/// A disconnect is not a trustworthy host reply, so release these
+/// tokens through the no-synthesis path rather than fabricating a
+/// cache-backed OSC answer from potentially stale global state.
 fn remove_client_and_flush_forwards(
     client_id: ClientId,
     os_input: &mut Box<dyn ServerOsApi>,
@@ -512,10 +515,7 @@ fn remove_client_and_flush_forwards(
         for token in stuck_tokens {
             let _ = session
                 .senders
-                .send_to_screen(ScreenInstruction::ForwardedReplyFromHost {
-                    token,
-                    reply_bytes: Vec::new(),
-                });
+                .send_to_screen(ScreenInstruction::ForwardedReplyFromHostNoSynthesis { token });
         }
     }
 }
@@ -709,17 +709,56 @@ impl SessionState {
     pub fn clear_forward_in_flight(&mut self, token: u32) {
         self.forwards_in_flight.remove(&token);
     }
-    /// Client to route a host-query forward to. Prefers whichever
-    /// client most recently interacted with the session; falls back
-    /// to any currently-connected non-watcher client. Returns `None`
-    /// only when no regular client is connected.
+    pub fn clear_forward_in_flight_from(&mut self, token: u32, client_id: ClientId) -> bool {
+        match self.forwards_in_flight.get(&token).copied() {
+            Some(owner) if owner == client_id => {
+                self.forwards_in_flight.remove(&token);
+                true
+            },
+            _ => false,
+        }
+    }
+    fn pipe_client_ids(&self) -> HashSet<ClientId> {
+        self.pipes.values().copied().collect()
+    }
+
+    fn is_safe_forward_target(&self, client_id: ClientId) -> bool {
+        let Some(Some((_size, is_web_client))) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if *is_web_client {
+            return false;
+        }
+        !self.pipe_client_ids().contains(&client_id)
+    }
+
+    fn safe_forward_targets(&self) -> Vec<ClientId> {
+        self.clients
+            .keys()
+            .copied()
+            .filter(|client_id| self.is_safe_forward_target(*client_id))
+            .collect()
+    }
+
+    /// Client to route a host-query forward to. Prefers whichever safe
+    /// native client most recently interacted with the session. If no
+    /// safe last-active client exists, falls back only when exactly one
+    /// safe native client is connected. Multiple safe clients without a
+    /// last-active client are ambiguous because their host terminals may
+    /// have different background colors; returning `None` lets Screen
+    /// fail closed without cache synthesis.
     pub fn pick_forward_target(&self) -> Option<ClientId> {
         if let Some(candidate) = self.last_active_client {
-            if self.clients.contains_key(&candidate) {
+            if self.is_safe_forward_target(candidate) {
                 return Some(candidate);
             }
         }
-        self.clients.keys().copied().next()
+        let safe_targets = self.safe_forward_targets();
+        if safe_targets.len() == 1 {
+            safe_targets.first().copied()
+        } else {
+            None
+        }
     }
 }
 
@@ -727,34 +766,65 @@ impl SessionState {
 mod session_state_tests {
     use super::*;
 
+    fn safe_size() -> Size {
+        Size { rows: 24, cols: 80 }
+    }
+
     fn with_client(id: ClientId) -> SessionState {
         let mut s = SessionState::new();
-        s.clients.insert(id, None);
+        s.set_client_data(id, safe_size(), false);
         s
     }
 
     #[test]
     fn pick_forward_target_prefers_last_active_when_still_connected() {
         let mut s = SessionState::new();
-        s.clients.insert(1, None);
-        s.clients.insert(2, None);
+        s.set_client_data(1, safe_size(), false);
+        s.set_client_data(2, safe_size(), false);
         s.set_last_active_client(2);
         assert_eq!(s.pick_forward_target(), Some(2));
     }
 
     #[test]
-    fn pick_forward_target_falls_back_when_last_active_disconnected() {
+    fn pick_forward_target_falls_back_to_single_safe_client_when_last_active_disconnected() {
         let mut s = SessionState::new();
-        s.clients.insert(1, None);
-        s.clients.insert(2, None);
+        s.set_client_data(1, safe_size(), false);
         // Client 3 was last active but has since disconnected — not in
-        // `clients` map anymore. Must fall through to any connected
-        // client rather than returning None.
+        // `clients` map anymore. Must fall through only when exactly
+        // one safe native client remains.
         s.last_active_client = Some(3);
-        let picked = s
-            .pick_forward_target()
-            .expect("some client still connected");
-        assert!(picked == 1 || picked == 2);
+        assert_eq!(s.pick_forward_target(), Some(1));
+    }
+
+    #[test]
+    fn pick_forward_target_none_when_multiple_safe_clients_without_last_active() {
+        let mut s = SessionState::new();
+        s.set_client_data(1, safe_size(), false);
+        s.set_client_data(2, safe_size(), false);
+        assert_eq!(s.pick_forward_target(), None);
+    }
+
+    #[test]
+    fn pick_forward_target_ignores_unsafe_clients() {
+        let mut s = SessionState::new();
+        s.set_client_data(1, safe_size(), false);
+        s.set_client_data(2, safe_size(), true); // web client: excluded unless proven safe
+        s.clients.insert(3, None); // uninitialized client
+        s.pipes.insert("pipe".to_owned(), 4);
+        s.set_client_data(4, safe_size(), false); // pipe-only client
+        s.watchers.insert(5, false);
+
+        assert_eq!(s.pick_forward_target(), Some(1));
+    }
+
+    #[test]
+    fn pick_forward_target_skips_unsafe_last_active() {
+        let mut s = SessionState::new();
+        s.set_client_data(1, safe_size(), false);
+        s.set_client_data(2, safe_size(), true);
+        s.set_last_active_client(2);
+
+        assert_eq!(s.pick_forward_target(), Some(1));
     }
 
     #[test]
@@ -770,7 +840,7 @@ mod session_state_tests {
         s.mark_forward_in_flight(11, 1);
         // A forward dispatched to a *different* client — must not be
         // returned when we remove client 1.
-        s.clients.insert(2, None);
+        s.set_client_data(2, safe_size(), false);
         s.mark_forward_in_flight(12, 2);
 
         let mut stuck = s.remove_client(1);
@@ -792,6 +862,178 @@ mod session_state_tests {
         s.clear_forward_in_flight(42);
         // After clear, removing the client yields no stuck tokens.
         assert!(s.remove_client(1).is_empty());
+    }
+
+    #[test]
+    fn clear_forward_in_flight_from_preserves_non_owner_token() {
+        let mut s = with_client(1);
+        s.set_client_data(2, safe_size(), false);
+        s.mark_forward_in_flight(42, 1);
+
+        assert!(!s.clear_forward_in_flight_from(42, 2));
+        assert_eq!(s.forwards_in_flight.get(&42), Some(&1));
+
+        assert!(s.clear_forward_in_flight_from(42, 1));
+        assert!(!s.forwards_in_flight.contains_key(&42));
+    }
+
+    #[derive(Clone, Default)]
+    struct RemoveOnlyOsInput;
+
+    impl ServerOsApi for RemoveOnlyOsInput {
+        fn set_terminal_size_using_terminal_id(
+            &self,
+            _id: u32,
+            _cols: u16,
+            _rows: u16,
+            _width_in_pixels: Option<u16>,
+            _height_in_pixels: Option<u16>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn spawn_terminal(
+            &self,
+            _terminal_action: TerminalAction,
+            _quit_cb: Box<dyn Fn(crate::panes::PaneId, Option<i32>, RunCommand) + Send>,
+            _default_editor: Option<PathBuf>,
+        ) -> Result<(
+            u32,
+            Box<dyn crate::os_input_output::AsyncReader>,
+            Option<u32>,
+        )> {
+            unimplemented!()
+        }
+
+        fn write_to_tty_stdin(&self, _terminal_id: u32, _buf: &[u8]) -> Result<usize> {
+            unimplemented!()
+        }
+
+        fn tcdrain(&self, _terminal_id: u32) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn kill(&self, _pid: u32) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn force_kill(&self, _pid: u32) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn send_sigint(&self, _pid: u32) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn box_clone(&self) -> Box<dyn ServerOsApi> {
+            Box::new((*self).clone())
+        }
+
+        fn send_to_client(&self, _client_id: ClientId, _msg: ServerToClientMsg) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn new_client(
+            &mut self,
+            _client_id: ClientId,
+            _stream: interprocess::local_socket::Stream,
+        ) -> Result<zellij_utils::ipc::IpcReceiverWithContext<zellij_utils::ipc::ClientToServerMsg>>
+        {
+            unimplemented!()
+        }
+
+        fn new_client_with_reply(
+            &mut self,
+            _client_id: ClientId,
+            _stream: interprocess::local_socket::Stream,
+            _reply_stream: interprocess::local_socket::Stream,
+        ) -> Result<zellij_utils::ipc::IpcReceiverWithContext<zellij_utils::ipc::ClientToServerMsg>>
+        {
+            unimplemented!()
+        }
+
+        fn remove_client(&mut self, _client_id: ClientId) -> Result<()> {
+            Ok(())
+        }
+
+        fn load_palette(&self) -> zellij_utils::data::Palette {
+            unimplemented!()
+        }
+
+        fn get_cwd(&self, _pid: u32) -> Option<PathBuf> {
+            unimplemented!()
+        }
+
+        fn write_to_file(&mut self, _buf: String, _file: Option<String>) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn re_run_command_in_terminal(
+            &self,
+            _terminal_id: u32,
+            _run_command: RunCommand,
+            _quit_cb: Box<dyn Fn(crate::panes::PaneId, Option<i32>, RunCommand) + Send>,
+        ) -> Result<(Box<dyn crate::os_input_output::AsyncReader>, Option<u32>)> {
+            unimplemented!()
+        }
+
+        fn clear_terminal_id(&self, _terminal_id: u32) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn test_session_metadata_with_screen_sender(
+        to_screen: SenderWithContext<ScreenInstruction>,
+    ) -> SessionMetaData {
+        SessionMetaData {
+            senders: ThreadSenders {
+                to_screen: Some(to_screen),
+                to_pty: None,
+                to_plugin: None,
+                to_pty_writer: None,
+                to_background_jobs: None,
+                to_server: None,
+                should_silently_fail: true,
+            },
+            default_shell: None,
+            current_input_modes: HashMap::new(),
+            session_configuration: Default::default(),
+            #[cfg(feature = "web_server_capability")]
+            web_sharing: WebSharing::Off,
+            #[cfg(not(feature = "web_server_capability"))]
+            web_sharing: WebSharing::Disabled,
+            screen_thread: None,
+            pty_thread: None,
+            plugin_thread: None,
+            pty_writer_thread: None,
+            background_jobs_thread: None,
+            config_file_path: None,
+        }
+    }
+
+    #[test]
+    fn disconnect_flush_uses_no_synthesis_reply() {
+        let mut s = with_client(1);
+        s.mark_forward_in_flight(77, 1);
+        let session_state = Arc::new(RwLock::new(s));
+        let (to_screen, screen_rx): ChannelWithContext<ScreenInstruction> = channels::unbounded();
+        let session_data = Arc::new(RwLock::new(Some(test_session_metadata_with_screen_sender(
+            SenderWithContext::new(to_screen),
+        ))));
+        let mut os_input: Box<dyn ServerOsApi> = Box::new(RemoveOnlyOsInput);
+
+        remove_client_and_flush_forwards(1, &mut os_input, &session_state, &session_data);
+
+        let (instruction, _context) = screen_rx
+            .try_recv()
+            .expect("disconnect must release the stuck forward");
+        assert!(
+            matches!(
+                instruction,
+                ScreenInstruction::ForwardedReplyFromHostNoSynthesis { token: 77 }
+            ),
+            "disconnect flush must not synthesize a cache-backed OSC reply"
+        );
     }
 }
 
@@ -1865,13 +2107,11 @@ pub fn start_server_impl(
                     .unwrap();
             },
             ServerInstruction::ForwardQueryToHost(token, query_bytes) => {
-                // Pick a regular (non-watcher) client to carry the
-                // forward. Preference is the most recently active
-                // client (whichever last sent input); falls back to
-                // any connected client. When the host terminals of
-                // attached clients differ, the recently-active one
-                // is the best proxy for "what the user is currently
-                // looking at".
+                // Pick a safe native client to carry the forward.
+                // Preference is the most recently active safe client;
+                // without one, only a single safe native client is
+                // deterministic. Multiple clients with different host
+                // backgrounds are ambiguous and must fail closed.
                 let target_client_id = {
                     let mut session = session_state.write().unwrap();
                     let picked = session.pick_forward_target();
@@ -1896,15 +2136,12 @@ pub fn start_server_impl(
                     // no way for them to drain until someone
                     // reattaches.
                     log::warn!(
-                        "No connected client to forward host query (token={}); returning empty reply",
+                        "No safe client to forward host query (token={}); returning empty no-synthesis reply",
                         token
                     );
                     if let Some(session) = session_data.read().unwrap().as_ref() {
                         let _ = session.senders.send_to_screen(
-                            ScreenInstruction::ForwardedReplyFromHost {
-                                token,
-                                reply_bytes: Vec::new(),
-                            },
+                            ScreenInstruction::ForwardedReplyFromHostNoSynthesis { token },
                         );
                     }
                 }

@@ -190,6 +190,32 @@ fn unsolicited_osc_between_forwarded_query_and_barrier() {
 }
 
 #[test]
+fn typed_forwarding_window_only_accumulates_matching_reply() {
+    let mut parser = StdinAnsiParser::new();
+    parser.open_forward_for_query(7, b"\x1b]11;?\x1b\\");
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(b"\x1b]10;rgb:2222/2222/2222\x1b\\");
+    chunk.extend_from_slice(b"\x1b]11;rgb:1111/1111/1111\x1b\\");
+    chunk.extend_from_slice(b"\x1b[c");
+    let out = parser.feed(&chunk);
+    assert_eq!(
+        out.replies.len(),
+        2,
+        "both replies still update host caches"
+    );
+    let (token, reply_bytes) = out.completed_forward.unwrap();
+    assert_eq!(token, 7);
+    assert!(
+        out.residue.is_empty(),
+        "host replies and DA barrier must not leak into keyboard residue"
+    );
+    assert_eq!(
+        reply_bytes, b"\x1b]11;rgb:1111/1111/1111\x1b\\",
+        "forwarded OSC11 payload must be exact and must not include OSC10 or DA barrier bytes"
+    );
+}
+
+#[test]
 fn double_dispatch_without_active_forward_still_emits_reply() {
     let mut parser = StdinAnsiParser::new();
     // No open_forward — reply should still be classified.

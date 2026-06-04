@@ -8880,6 +8880,29 @@ fn empty_reply_falls_back_to_cached_background() {
 }
 
 #[test]
+fn no_synthesis_reply_does_not_fall_back_to_cached_background() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, capture) = create_new_screen_with_forward_capture(size);
+    let pane = PaneId::Terminal(9);
+    screen.update_terminal_background_color("rgb:1010/2020/3030".to_string());
+    let token = screen.forward_host_query(pane, bg_query());
+    let _ = capture.drain_forward_queries();
+
+    screen
+        .handle_forwarded_reply_from_host_no_synthesis(token)
+        .expect("ok");
+
+    let writes = capture.drain_pty_writes();
+    assert_eq!(writes.len(), 1, "pane must resume exactly once");
+    assert_eq!(writes[0].1, 9);
+    assert!(
+        writes[0].0.is_empty(),
+        "ambiguous/no-target path must not synthesize stale cached OSC11"
+    );
+    assert!(screen.forward_in_flight_token.is_none());
+}
+
+#[test]
 fn empty_reply_falls_back_to_cached_foreground_with_bel_terminator() {
     // Query used BEL; reply must mirror the same terminator.
     let size = Size { cols: 80, rows: 20 };

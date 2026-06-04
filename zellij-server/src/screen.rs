@@ -523,6 +523,14 @@ pub enum ScreenInstruction {
         token: u32,
         reply_bytes: Vec<u8>,
     },
+    /// A forwarded query could not be sent to a safe host terminal
+    /// client. This releases the in-flight slot and resumes the pane
+    /// with an empty/no-reply payload, but deliberately bypasses cache
+    /// synthesis so ambiguous multi-client state cannot fabricate a
+    /// stale OSC 11 answer.
+    ForwardedReplyFromHostNoSynthesis {
+        token: u32,
+    },
     /// Internal: a forwarded reply (or its cache-fallback synthesis,
     /// or a locally-answered query like `ColorPaletteMode`) is ready
     /// to be delivered to the originating pane. Routed through the
@@ -1022,6 +1030,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ForwardedReplyFromHost { .. } => {
                 ScreenContext::ForwardedReplyFromHost
             },
+            ScreenInstruction::ForwardedReplyFromHostNoSynthesis { .. } => {
+                ScreenContext::ForwardedReplyFromHost
+            },
             ScreenInstruction::ResumePaneAfterForward { .. } => {
                 ScreenContext::ResumePaneAfterForward
             },
@@ -1519,6 +1530,12 @@ const STARTUP_SENTINEL_TOKEN: u32 = 0;
 /// client always replies first; only the old-client and
 /// network-pathological cases ever see this fire.
 const SERVER_FORWARD_TIMEOUT_MS: u64 = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyForwardedReplyPolicy {
+    SynthesizeCache,
+    NoSynthesis,
+}
 
 impl Screen {
     /// Creates and returns a new [`Screen`].
@@ -2616,6 +2633,27 @@ impl Screen {
         token: u32,
         reply_bytes: Vec<u8>,
     ) -> Result<()> {
+        self.handle_forwarded_reply_from_host_with_policy(
+            token,
+            reply_bytes,
+            EmptyForwardedReplyPolicy::SynthesizeCache,
+        )
+    }
+
+    pub fn handle_forwarded_reply_from_host_no_synthesis(&mut self, token: u32) -> Result<()> {
+        self.handle_forwarded_reply_from_host_with_policy(
+            token,
+            Vec::new(),
+            EmptyForwardedReplyPolicy::NoSynthesis,
+        )
+    }
+
+    fn handle_forwarded_reply_from_host_with_policy(
+        &mut self,
+        token: u32,
+        reply_bytes: Vec<u8>,
+        empty_reply_policy: EmptyForwardedReplyPolicy,
+    ) -> Result<()> {
         // Stale-reply guard. Both the real `ForwardedReplyFromHost`
         // path and the server-side timeout path land here. If a real
         // reply landed first (releasing the slot AND dispatching the
@@ -2638,7 +2676,12 @@ impl Screen {
             match pane_id {
                 PaneId::Terminal(_) => {
                     let payload = if reply_bytes.is_empty() {
-                        self.synthesize_cached_reply(&query)
+                        match empty_reply_policy {
+                            EmptyForwardedReplyPolicy::SynthesizeCache => {
+                                self.synthesize_cached_reply(&query)
+                            },
+                            EmptyForwardedReplyPolicy::NoSynthesis => Vec::new(),
+                        }
                     } else {
                         reply_bytes
                     };
@@ -7862,6 +7905,10 @@ pub(crate) fn screen_thread_main(
                 // The handler's replay of `pending_pty_input` mutates the
                 // grid. Without a render scheduling here the clients
                 // keep displaying the pre-reply frame
+                screen.render(None)?;
+            },
+            ScreenInstruction::ForwardedReplyFromHostNoSynthesis { token } => {
+                screen.handle_forwarded_reply_from_host_no_synthesis(token)?;
                 screen.render(None)?;
             },
             ScreenInstruction::ResumePaneAfterForward {
